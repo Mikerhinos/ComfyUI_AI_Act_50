@@ -51,20 +51,22 @@ except ImportError:
 
 
 # ==============================================================================
-# 1. LECTEUR DE TAGS MP3
+# 1. LECTEUR ET EXTRACTEUR DE TAGS AUDIO / MP3
 # ==============================================================================
 
 class MP3TagUploader_v5:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "audio_file_name": ("STRING", {"default": ""}),
+            "required": {},
+            "optional": {
+                "audio_file_name": ("STRING", {"default": "", "placeholder": "Nom du fichier MP3 (ex: output.mp3)..."}),
+                "audio": ("AUDIO",),
             }
         }
 
     RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING") 
-    RETURN_NAMES = ("artist", "title", "filename_safe", "lyrics")
+    RETURN_NAMES = ("author", "lyrics", "title", "filename_safe")
     FUNCTION = "extract"
     CATEGORY = "audio/tags"
 
@@ -79,71 +81,85 @@ class MP3TagUploader_v5:
         safe_title = safe_title.strip('_')
         return safe_title
 
-    def extract(self, audio_file_name):
+    def extract(self, audio_file_name="", audio=None):
         if not MUTAGEN_LOADED:
             log_cyan("Échec extraction MP3 : dépendance 'mutagen' manquante.", is_error=True)
-            return ("ERREUR: Dépendance manquante", "Veuillez installer mutagen", "erreur_mutagen", "")
-            
-        if not audio_file_name:
-            log_cyan("Échec extraction MP3 : aucun nom de fichier fourni.", is_error=True)
-            return ("Erreur: Aucun fichier", "Aucun fichier sélectionné", "aucun_fichier", "")
+            return ("ERREUR: Dépendance manquante", "Veuillez installer mutagen: pip install mutagen", "erreur_mutagen", "erreur")
 
         full_path = None
-        cwd = os.getcwd()
-        comfy_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        if "comfy.git" in comfy_root:
-             comfy_root = os.path.dirname(comfy_root)
 
-        search_paths = [
-            os.path.join(cwd, "input"),
-            os.path.join(cwd, "output"),
-            os.path.join(cwd, "temp"),
-            os.path.join(comfy_root, "input"),
-            os.path.join(comfy_root, "output"),
-            cwd,
-        ]
-        
-        for path in search_paths:
-            potential_path = os.path.join(path, audio_file_name)
-            if os.path.exists(potential_path):
-                full_path = potential_path
-                break
+        # 1. Recherche via le dictionnaire AUDIO si un chemin y est attaché
+        if audio is not None and isinstance(audio, dict):
+            if "path" in audio and os.path.exists(audio["path"]):
+                full_path = audio["path"]
+            elif "filename" in audio:
+                audio_file_name = audio["filename"]
+
+        # 2. Recherche du fichier sur le disque
+        if not full_path and audio_file_name:
+            cwd = os.getcwd()
+            comfy_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            if "comfy.git" in comfy_root:
+                 comfy_root = os.path.dirname(comfy_root)
+
+            search_paths = [
+                folder_paths.get_input_directory(),
+                folder_paths.get_output_directory(),
+                folder_paths.get_temp_directory(),
+                os.path.join(cwd, "output"),
+                os.path.join(cwd, "input"),
+                os.path.join(cwd, "temp"),
+                os.path.join(comfy_root, "output"),
+                os.path.join(comfy_root, "input"),
+                cwd,
+            ]
+            
+            for path in search_paths:
+                potential_path = os.path.join(path, audio_file_name)
+                if os.path.exists(potential_path):
+                    full_path = potential_path
+                    break
         
         if not full_path or not os.path.exists(full_path):
-             log_cyan(f"Échec extraction MP3 : fichier introuvable '{audio_file_name}'.", is_error=True)
-             return ("Erreur de chemin", "Le fichier MP3 est introuvable.", "erreur_chemin", "")
+             log_cyan(f"Échec extraction MP3 : fichier introuvable ('{audio_file_name}').", is_error=True)
+             return ("Erreur: Fichier introuvable", "", "Fichier introuvable", "erreur_chemin")
         
+        author = "Inconnu"
+        title = "Inconnu"
         lyrics_text = ""
+
         try:
-            audio = mutagen.File(full_path, easy=True)
-            if audio is None:
-                log_cyan(f"Échec lecture tags Mutagen sur '{full_path}'", is_error=True)
-                return ("Erreur de lecture", "Format non supporté", "erreur_lecture", "")
+            # Extraction des métadonnées standards (Artist, Title)
+            audio_obj = mutagen.File(full_path, easy=True)
+            if audio_obj is not None:
+                author = audio_obj.get("artist", ["Inconnu"])[0]
+                title = audio_obj.get("title", ["Inconnu"])[0] 
 
-            artist = audio.get("artist", ["Inconnu"])[0]
-            title = audio.get("title", ["Inconnu"])[0] 
-            filename_safe_title = self.format_title_for_filename(title)
-
-            # Lecture du tag Lyrics USLT
+            # Extraction des paroles / texte TTS via ID3 USLT / COMM
             if ID3:
                 try:
                     id3_tags = ID3(full_path)
                     uslt_frames = id3_tags.getall("USLT")
                     if uslt_frames:
-                        lyrics_text = uslt_frames[0].text
-                except Exception:
-                    pass
+                        lyrics_text = str(uslt_frames[0].text)
+                    else:
+                        comm_frames = id3_tags.getall("COMM")
+                        if comm_frames:
+                            lyrics_text = str(comm_frames[0].text)
+                except Exception as e_id3:
+                    log_cyan(f"Information : Pas de tag ID3 USLT/COMM lisible dans '{audio_file_name}': {e_id3}")
 
-            log_cyan(f"✅ Tags MP3 lus ('{audio_file_name}') -> Artiste: '{artist}' | Titre: '{title}' | Paroles: {len(lyrics_text)} car.")
+            filename_safe_title = self.format_title_for_filename(title)
+            log_cyan(f"✅ Tags lus ('{os.path.basename(full_path)}') -> Auteur: '{author}' | Paroles: {len(lyrics_text)} car. | Titre: '{title}'")
 
         except Exception as e:
             log_cyan(f"Erreur de lecture des tags MP3 : {e}", is_error=True)
-            artist = "Erreur lecture"
+            author = "Erreur lecture"
             title = "Erreur lecture"
-            filename_safe_title = "erreur_lecture_safe"
             lyrics_text = ""
+            filename_safe_title = "erreur_lecture_safe"
         
-        return (artist, title, filename_safe_title, lyrics_text)
+        return (author, lyrics_text, title, filename_safe_title)
 
 
 # ==============================================================================
@@ -307,7 +323,6 @@ class UniversalAIActSaver:
 
             torchaudio.save(temp_wav, waveform_save, sr, format="wav")
 
-            # Construction MP3 avec métadonnées FFmpeg (dont lyrics/comment)
             def build_mp3(out_path):
                 ffmpeg_cmd = [
                     'ffmpeg', '-y', '-v', 'error',
@@ -331,7 +346,6 @@ class UniversalAIActSaver:
             if os.path.exists(temp_wav):
                 os.unlink(temp_wav)
 
-            # Injection ID3 USLT (Unsynchronized Lyrics/TTS Text) via Mutagen
             if MUTAGEN_LOADED:
                 for target_path in [final_mp3, temp_mp3_preview]:
                     try:
@@ -350,7 +364,6 @@ class UniversalAIActSaver:
                     if lyrics and ID3:
                         try:
                             id3_tags = ID3(target_path)
-                            # Tag officiel ID3 v2.3 pour paroles / transcription de texte
                             id3_tags.add(USLT(encoding=3, lang='fra', desc='TTS Text', text=lyrics))
                             id3_tags.add(COMM(encoding=3, lang='fra', desc='TTS Prompt', text=lyrics))
                             id3_tags.save(v2_version=3)
@@ -458,7 +471,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MP3TagUploader_v5": "MP3 Tag Uploader (v5)",
+    "MP3TagUploader_v5": "MP3 Tag Uploader / Loader (v5)",
     "UniversalAIActSaver": "Universal AI Act Saver (Image / Audio / Vidéo)",
 }
 
