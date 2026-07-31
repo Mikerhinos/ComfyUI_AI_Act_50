@@ -4,10 +4,10 @@ import { api } from "/scripts/api.js";
 app.registerExtension({
     name: "AIAct.MP3TagUploader",
     async nodeCreated(node) {
-        // Cibler le nœud d'extraction / téléversement de tags
-        if (node.comfyClass === "MP3TagUploader_v5" || node.comfyClass === "UniversalAIActSaver") {
+        // Cibler UNIQUEMENT le nœud d'extraction / téléversement de tags MP3
+        if (node.comfyClass === "MP3TagUploader_v5") {
             
-            // Ajouter le bouton sur l'interface du nœud
+            // Ajouter le bouton sur l'interface du nœud MP3TagUploader_v5
             node.addWidget("button", "📁 Parcourir & Charger MP3", "upload", () => {
                 
                 // Créer un élément HTML 'input file' invisible
