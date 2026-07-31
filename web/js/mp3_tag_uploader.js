@@ -4,10 +4,10 @@ import { api } from "/scripts/api.js";
 app.registerExtension({
     name: "AIAct.MP3TagUploader",
     async nodeCreated(node) {
-        // Cibler uniquement notre nœud d'extraction de tags
-        if (node.comfyClass === "MP3TagUploader_v5") {
+        // Cibler le nœud d'extraction / téléversement de tags
+        if (node.comfyClass === "MP3TagUploader_v5" || node.comfyClass === "UniversalAIActSaver") {
             
-            // Ajouter un bouton sur l'interface du nœud dans ComfyUI
+            // Ajouter le bouton sur l'interface du nœud
             node.addWidget("button", "📁 Parcourir & Charger MP3", "upload", () => {
                 
                 // Créer un élément HTML 'input file' invisible
@@ -17,14 +17,14 @@ app.registerExtension({
                 fileInput.style.display = "none";
                 document.body.appendChild(fileInput);
 
-                // Déclenché lorsque l'utilisateur sélectionne un fichier dans le navigateur
+                // Déclenché lorsque l'utilisateur sélectionne un fichier
                 fileInput.onchange = async (event) => {
                     const file = event.target.files[0];
                     if (!file) return;
 
-                    // Préparer l'envoi du fichier vers l'API interne de ComfyUI
+                    // Préparer le fichier pour l'API d'upload de ComfyUI
                     const formData = new FormData();
-                    formData.append("image", file); // L'endpoint ComfyUI /upload/image prend en charge les médias
+                    formData.append("image", file); // ComfyUI utilise l'endpoint /upload/image pour tous les médias
                     formData.append("overwrite", "true");
                     formData.append("subfolder", "");
                     formData.append("type", "input");
@@ -38,14 +38,14 @@ app.registerExtension({
                         if (response.status === 200) {
                             const data = await response.json();
                             
-                            // Mettre à jour le champ 'audio_file_name' avec le nom du fichier transféré
+                            // Mettre à jour le champ 'audio_file_name' avec le nom du fichier transféré dans input/
                             const widget = node.widgets.find((w) => w.name === "audio_file_name");
                             if (widget) {
                                 widget.value = data.name;
                                 app.graph.setDirtyCanvas(true, true);
                             }
                         } else {
-                            alert("Erreur lors de l'envoi du fichier à ComfyUI.");
+                            alert("Erreur lors du transfert du fichier vers ComfyUI.");
                         }
                     } catch (error) {
                         console.error("Erreur d'upload :", error);
@@ -55,7 +55,7 @@ app.registerExtension({
                     }
                 };
 
-                // Ouvrir l'explorateur de fichiers local
+                // Déclencher l'ouverture de l'explorateur de fichiers système
                 fileInput.click();
             });
         }
