@@ -1,0 +1,25 @@
+# Caches Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environnements virtuels
+venv/
+.venv/
+env/
+
+# Fichiers temporaires et exports de test
+*.mp3
+*.mp4
+*.png
+*.jpg
+temp/
+
+# IDE / Éditeurs
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

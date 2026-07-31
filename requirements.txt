@@ -1,0 +1,7 @@
+torch
+torchaudio
+numpy
+Pillow
+imageio
+imageio-ffmpeg
+mutagen
