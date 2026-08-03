@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-ai-act-50"
+version = "1.0.0"
+description = "A custom node to add metadata to images, videos and audios, to be conform to the new article 50 of EU AI Act law."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Mikerhinos" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch",
+    "torchaudio",
+    "numpy",
+    "Pillow",
+    "imageio",
+    "imageio-ffmpeg",
+    "mutagen",
+]
+
+[project.urls]
+Repository = "https://github.com/Mikerhinos/ComfyUI_AI_Act_50"
+Homepage = "https://github.com/Mikerhinos/ComfyUI_AI_Act_50"
+
+[tool.comfy]
+PublisherId = "mikerhinos"
+DisplayName = "AI Act Transparency Node"
+Icon = ""
