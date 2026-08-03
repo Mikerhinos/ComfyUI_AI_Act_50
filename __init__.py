@@ -334,6 +334,7 @@ class UniversalAIActSaver:
                     "Vidéo MP4",
                     "Audio MP3"
                 ], {"default": "Auto-détection"}),
+                "auto_increment": ("BOOLEAN", {"default": True, "label_on": "Numérotation auto (0001, 0002...)", "label_off": "Nom fixe (écrase le précédent)"}),
             },
             "optional": {
                 "images": ("IMAGE",),
@@ -353,7 +354,24 @@ class UniversalAIActSaver:
     def sanitize_filename(self, filename):
         return re.sub(r'[\\/:*?"<>|]', '_', filename).strip()
 
-    def process(self, filename="AI_Act_Output", author="AI Generator", title="AI Generated Media", ai_label="Généré par IA", save_path="", export_mode="Auto-détection", images=None, audio=None, fps=24.0, lyrics="", prompt=None, extra_pnginfo=None):
+    def get_next_available_number(self, dest_dir, clean_name, ext):
+        """
+        Scanne dest_dir à la recherche de fichiers 'clean_nameNNNN.ext' et retourne
+        le prochain numéro libre (max trouvé + 1, ou 1 si aucun fichier existant).
+        Chaque extension (png, mp4, mp3...) a son propre compteur indépendant.
+        """
+        pattern = re.compile(rf'^{re.escape(clean_name)}(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
+        max_num = 0
+        try:
+            for fname in os.listdir(dest_dir):
+                m = pattern.match(fname)
+                if m:
+                    max_num = max(max_num, int(m.group(1)))
+        except Exception as e:
+            log_cyan(f"Avertissement lors du scan de numérotation dans '{dest_dir}': {e}")
+        return max_num + 1
+
+    def process(self, filename="AI_Act_Output", author="AI Generator", title="AI Generated Media", ai_label="Généré par IA", save_path="", export_mode="Auto-détection", auto_increment=True, images=None, audio=None, fps=24.0, lyrics="", prompt=None, extra_pnginfo=None):
         
         clean_name = self.sanitize_filename(filename)
         dest_dir = save_path.strip() if save_path else get_default_downloads_dir()
@@ -407,6 +425,10 @@ class UniversalAIActSaver:
             log_cyan(f"DEBUG: début boucle d'écriture -> {len(images)} image(s) à traiter, format={ext.upper()}, "
                       f"auteur='{author}', titre='{title}', ai_label='{ai_label}'")
 
+            start_num = self.get_next_available_number(dest_dir, clean_name, ext) if auto_increment else None
+            if auto_increment:
+                log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{clean_name}NNNN.{ext}' = {start_num:04d}")
+
             for idx, img_tensor in enumerate(images):
                 img_np = (255. * img_tensor.cpu().numpy()).clip(0, 255).astype(np.uint8)
                 pil_img = Image.fromarray(img_np)
@@ -426,8 +448,11 @@ class UniversalAIActSaver:
                     log_cyan(f"Erreur encodage XPAuthor: {e_xp}", is_error=True)
 
                 exif_bytes = exif.tobytes()
-                suffix = f"_{idx:04d}" if len(images) > 1 else ""
-                final_file_path = os.path.join(dest_dir, f"{clean_name}{suffix}.{ext}")
+                if auto_increment:
+                    final_file_path = os.path.join(dest_dir, f"{clean_name}{start_num + idx:04d}.{ext}")
+                else:
+                    suffix = f"_{idx:04d}" if len(images) > 1 else ""
+                    final_file_path = os.path.join(dest_dir, f"{clean_name}{suffix}.{ext}")
 
                 metadata = None
                 if not is_jpg:
@@ -552,7 +577,12 @@ class UniversalAIActSaver:
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
             temp_wav = os.path.join(temp_dir, f"temp_{timestamp_id}.wav")
-            final_mp3 = os.path.join(dest_dir, f"{clean_name}.mp3")
+            if auto_increment:
+                mp3_num = self.get_next_available_number(dest_dir, clean_name, "mp3")
+                log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{clean_name}NNNN.mp3' = {mp3_num:04d}")
+                final_mp3 = os.path.join(dest_dir, f"{clean_name}{mp3_num:04d}.mp3")
+            else:
+                final_mp3 = os.path.join(dest_dir, f"{clean_name}.mp3")
             temp_mp3_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp3")
 
             torchaudio.save(temp_wav, waveform_save, sr, format="wav")
@@ -628,7 +658,12 @@ class UniversalAIActSaver:
             
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
-            final_mp4 = os.path.join(dest_dir, f"{clean_name}.mp4")
+            if auto_increment:
+                mp4_num = self.get_next_available_number(dest_dir, clean_name, "mp4")
+                log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{clean_name}NNNN.mp4' = {mp4_num:04d}")
+                final_mp4 = os.path.join(dest_dir, f"{clean_name}{mp4_num:04d}.mp4")
+            else:
+                final_mp4 = os.path.join(dest_dir, f"{clean_name}.mp4")
             temp_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp4")
 
             ffmpeg_metadata = [
