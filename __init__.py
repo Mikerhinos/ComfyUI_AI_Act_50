@@ -65,6 +65,120 @@ def get_default_downloads_dir():
     return folder_paths.get_output_directory()
 
 
+# ==============================================================================
+# ÉCRITURE DES MÉTADONNÉES PNG VIA LE COMPOSANT NATIF WINDOWS (WIC / .NET)
+# ==============================================================================
+# Pillow écrit des chunks PNG tEXt/iTXt et un chunk exif valides (confirmé par nos
+# tests), mais l'explorateur Windows ne les lit quasiment jamais pour un PNG - même
+# quand ils sont parfaitement conformes à la spec. La seule façon fiable de faire
+# apparaître les métadonnées dans l'onglet "Détails" de Windows pour un PNG est de
+# les écrire avec le même composant que Windows utilise pour les lire : WIC, via les
+# classes .NET System.Windows.Media.Imaging (BitmapMetadata / PngBitmapEncoder).
+# On appelle donc PowerShell en post-traitement, uniquement sous Windows.
+
+_PS_SCRIPT_TEMPLATE = r'''
+param(
+    [Parameter(Mandatory=$true)][string]$FilePath,
+    [Parameter(Mandatory=$true)][string]$Author,
+    [Parameter(Mandatory=$true)][string]$Title,
+    [Parameter(Mandatory=$true)][string]$CommentText
+)
+
+Add-Type -AssemblyName PresentationCore
+
+try {
+    $uri = New-Object System.Uri($FilePath)
+    $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
+        $uri,
+        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    )
+    $frame = $decoder.Frames[0]
+
+    $metadata = New-Object System.Windows.Media.Imaging.BitmapMetadata("png")
+
+    # IMPORTANT : on utilise les propriétés typées de BitmapMetadata (Author/Title/
+    # Comment) plutôt que des chemins SetQuery bruts ("/tEXt/{str=Author}" etc.).
+    # Test empirique : les chemins bruts pour Author/Title ne persistaient PAS après
+    # l'encodage PNG (seul Comment survivait), alors que les propriétés typées sont
+    # l'API officiellement supportée par chaque codec pour un round-trip fiable.
+    $authorList = New-Object 'System.Collections.Generic.List[string]'
+    $authorList.Add($Author)
+    $metadata.Author = $authorList.AsReadOnly()
+    $metadata.Title = $Title
+    $metadata.Comment = $CommentText
+
+    $newFrame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+        $frame, $frame.Thumbnail, $metadata, $frame.ColorContexts
+    )
+
+    $tempPath = "$FilePath.aiact_tmp.png"
+    $stream = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::Create)
+    $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $encoder.Frames.Add($newFrame)
+    $encoder.Save($stream)
+    $stream.Close()
+
+    Move-Item -Force $tempPath $FilePath
+
+    # Vérification immédiate : on relit le fichier qu'on vient d'écrire et on
+    # renvoie ce que WIC lui-même retrouve, pour diagnostiquer sans ambiguïté.
+    $verifyDecoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
+        (New-Object System.Uri($FilePath)),
+        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+    )
+    $verifyMeta = $verifyDecoder.Frames[0].Metadata
+    $verifiedAuthor = if ($verifyMeta.Author) { $verifyMeta.Author -join ";" } else { "(vide)" }
+    $verifiedTitle = if ($verifyMeta.Title) { $verifyMeta.Title } else { "(vide)" }
+    $verifiedComment = if ($verifyMeta.Comment) { $verifyMeta.Comment } else { "(vide)" }
+    Write-Output "OK author='$verifiedAuthor' title='$verifiedTitle' comment='$verifiedComment'"
+}
+catch {
+    Write-Output "ERROR: $($_.Exception.Message)"
+    exit 1
+}
+'''
+
+
+def write_windows_native_png_metadata(file_path, author, title, comment_text):
+    """
+    Réécrit le PNG situé à file_path en y injectant les métadonnées via le
+    pipeline WIC natif de Windows (.NET/PowerShell), pour garantir la
+    compatibilité avec l'onglet Détails de l'explorateur Windows.
+    Retourne (succes: bool, message: str). No-op (True, "ignoré (non-Windows)")
+    sur les systèmes non-Windows.
+    """
+    if os.name != "nt":
+        return True, "ignoré (système non-Windows)"
+
+    try:
+        temp_dir = folder_paths.get_temp_directory()
+        ps_script_path = os.path.join(temp_dir, "ai_act_write_png_metadata.ps1")
+        with open(ps_script_path, "w", encoding="utf-8") as f:
+            f.write(_PS_SCRIPT_TEMPLATE)
+
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", ps_script_path,
+                "-FilePath", file_path,
+                "-Author", author,
+                "-Title", title,
+                "-CommentText", comment_text,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+
+        if result.returncode != 0 or stdout.startswith("ERROR"):
+            return False, f"code={result.returncode} stdout='{stdout}' stderr='{stderr}'"
+        return True, stdout
+    except Exception as e:
+        return False, f"Exception Python: {e}"
+
+
 # Gestion sécurisée de Mutagen & ID3 Lyrics
 try:
     import mutagen
@@ -251,20 +365,31 @@ class UniversalAIActSaver:
                 log_cyan(f"Impossible de créer le dossier de destination {dest_dir}: {e}", is_error=True)
                 dest_dir = folder_paths.get_output_directory()
 
+        nb_images = len(images) if images is not None else 0
+        log_cyan(f"DEBUG: entrée reçue -> images={'oui (' + str(nb_images) + ')' if images is not None else 'non'}, "
+                  f"audio={'oui' if audio is not None else 'non'}, export_mode='{export_mode}'")
+        log_cyan(f"DEBUG: dossier de destination résolu -> '{dest_dir}' (existe={os.path.isdir(dest_dir)}, "
+                  f"accessible en écriture={os.access(dest_dir, os.W_OK) if os.path.isdir(dest_dir) else 'N/A'})")
+
         target_type = export_mode
         if target_type == "Auto-détection":
             if audio is not None and images is None:
+                # Audio seul -> MP3
                 target_type = "Audio MP3"
             elif images is not None and audio is not None:
+                # Images + Audio -> on suppose une séquence animée avec son -> Vidéo
                 target_type = "Vidéo MP4"
             elif images is not None:
-                if len(images) > 1:
-                    target_type = "Vidéo MP4"
-                else:
-                    target_type = "Image JPG (Visible dans Windows)"
+                # Images seules (une ou plusieurs) SANS audio -> toujours PNG, y compris
+                # pour une seule image : le JPG ne supporte pas le canal alpha, qui est
+                # requis ici. La compatibilité avec l'explorateur Windows est assurée par
+                # write_windows_native_png_metadata() (réécriture WIC), pas par le choix
+                # du format JPG.
+                target_type = "Image PNG"
             else:
                 log_cyan("Aucun flux d'entrée connecté.", is_error=True)
                 return {"ui": {}, "result": ("Aucune entrée connectée",)}
+        log_cyan(f"DEBUG: mode d'export résolu -> '{target_type}'")
 
         # ----------------------------------------------------------------------
         # CAS 1 : IMAGE (JPG / PNG)
@@ -278,6 +403,9 @@ class UniversalAIActSaver:
             ext = "jpg" if is_jpg else "png"
             results = []
             saved_paths = []
+
+            log_cyan(f"DEBUG: début boucle d'écriture -> {len(images)} image(s) à traiter, format={ext.upper()}, "
+                      f"auteur='{author}', titre='{title}', ai_label='{ai_label}'")
 
             for idx, img_tensor in enumerate(images):
                 img_np = (255. * img_tensor.cpu().numpy()).clip(0, 255).astype(np.uint8)
@@ -303,30 +431,99 @@ class UniversalAIActSaver:
 
                 metadata = None
                 if not is_jpg:
+                    # IMPORTANT: on utilise add_itxt (chunk iTXt, UTF-8) et non add_text
+                    # (chunk tEXt, Latin-1 strict). Nos textes contiennent des accents
+                    # français (ex: "Généré par IA"), qui produisent des octets Latin-1
+                    # invalides en UTF-8. Certains lecteurs de métadonnées (dont
+                    # l'explorateur Windows) décodent en UTF-8 strict et abandonnent
+                    # silencieusement la lecture de TOUTES les métadonnées du fichier
+                    # dès qu'un seul chunk est mal formé. iTXt règle ce problème à la
+                    # racine en étant explicitement encodé en UTF-8.
+                    comment_text = f"{ai_label} - EU AI Act Art. 50"
                     metadata = PngImagePlugin.PngInfo()
-                    metadata.add_text("Author", author)
-                    metadata.add_text("Artist", author)
-                    metadata.add_text("Title", title)
-                    metadata.add_text("Comment", f"{ai_label} - EU AI Act Art. 50")
-                    if lyrics:
-                        metadata.add_text("Description", lyrics)
+                    metadata.add_itxt("Author", author)
+                    metadata.add_itxt("Artist", author)
+                    metadata.add_itxt("Title", title)
+                    metadata.add_itxt("Comment", comment_text)
+                    # Un seul chunk "Description" (certains lecteurs ne gardent que le
+                    # premier/dernier en cas de doublon) : priorité aux paroles/texte TTS
+                    # si présent, sinon le texte de transparence IA.
+                    metadata.add_itxt("Description", lyrics if lyrics else comment_text)
 
-                if is_jpg:
-                    pil_img.save(final_file_path, format="JPEG", quality=95, exif=exif_bytes)
-                else:
-                    pil_img.save(final_file_path, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
+                log_cyan(f"DEBUG: [image {idx}] écriture prévue -> '{final_file_path}' "
+                          f"(exif_bytes={len(exif_bytes)} octets, pnginfo={'oui' if metadata else 'non'})")
+
+                try:
+                    if is_jpg:
+                        pil_img.save(final_file_path, format="JPEG", quality=95, exif=exif_bytes)
+                    else:
+                        pil_img.save(final_file_path, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
+                except Exception as e_save:
+                    import traceback
+                    log_cyan(f"ÉCHEC écriture image {idx} vers '{final_file_path}': {e_save}", is_error=True)
+                    log_cyan(traceback.format_exc(), is_error=True)
+                    continue
+
+                # Sur PNG, on repasse par le pipeline natif Windows (WIC/.NET) pour que
+                # les métadonnées soient visibles dans l'onglet Détails de l'explorateur.
+                if not is_jpg:
+                    win_ok, win_msg = write_windows_native_png_metadata(
+                        final_file_path, author, title, f"{ai_label} - EU AI Act Art. 50"
+                    )
+                    if win_ok:
+                        log_cyan(f"DEBUG: [image {idx}] réécriture WIC/Windows -> {win_msg}")
+                    else:
+                        log_cyan(f"⚠️  [image {idx}] échec réécriture WIC/Windows -> {win_msg}", is_error=True)
+
+                # Vérification post-écriture : on rouvre le fichier tout juste écrit
+                # pour confirmer que les métadonnées y sont bien présentes.
+                try:
+                    check_img = Image.open(final_file_path)
+                    if is_jpg:
+                        check_exif = check_img.getexif()
+                        found_author = check_exif.get(0x013B)
+                        log_cyan(f"DEBUG: [image {idx}] vérification post-écriture (JPEG EXIF) -> "
+                                  f"Author(0x013B)='{found_author}'")
+                    else:
+                        found_keys = {k: v for k, v in check_img.info.items() if k != "exif"}
+                        has_exif_chunk = "exif" in check_img.info
+                        log_cyan(f"DEBUG: [image {idx}] vérification post-écriture (PNG tEXt) -> "
+                                  f"chunks trouvés={found_keys}, chunk exif présent={has_exif_chunk}")
+                        if not found_keys:
+                            log_cyan(f"⚠️  [image {idx}] AUCUN chunk tEXt retrouvé après relecture de "
+                                      f"'{final_file_path}' -- le fichier a été écrit sans métadonnées !", is_error=True)
+                    check_img.close()
+                except Exception as e_check:
+                    log_cyan(f"Impossible de relire '{final_file_path}' pour vérification: {e_check}", is_error=True)
 
                 saved_paths.append(final_file_path)
 
                 temp_preview = os.path.join(folder_paths.get_temp_directory(), f"prev_{int(time.time())}_{idx}.{ext}")
-                if is_jpg:
-                    pil_img.save(temp_preview, format="JPEG", quality=95, exif=exif_bytes)
-                else:
-                    pil_img.save(temp_preview, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
+                try:
+                    if is_jpg:
+                        pil_img.save(temp_preview, format="JPEG", quality=95, exif=exif_bytes)
+                    else:
+                        pil_img.save(temp_preview, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
+                except Exception as e_prev:
+                    log_cyan(f"ÉCHEC écriture preview {idx} vers '{temp_preview}': {e_prev}", is_error=True)
+                    continue
+
+                # Le clic droit -> "Save Image" dans l'UI ComfyUI sauvegarde CE fichier
+                # de preview, pas le fichier final écrit plus haut. Il doit donc lui aussi
+                # passer par la réécriture WIC/Windows pour avoir des métadonnées visibles.
+                if not is_jpg:
+                    win_ok_prev, win_msg_prev = write_windows_native_png_metadata(
+                        temp_preview, author, title, f"{ai_label} - EU AI Act Art. 50"
+                    )
+                    if win_ok_prev:
+                        log_cyan(f"DEBUG: [image {idx}] réécriture WIC/Windows (preview) -> {win_msg_prev}")
+                    else:
+                        log_cyan(f"⚠️  [image {idx}] échec réécriture WIC/Windows (preview) -> {win_msg_prev}", is_error=True)
 
                 results.append({"filename": os.path.basename(temp_preview), "subfolder": "", "type": "temp"})
 
             out_str = saved_paths[0] if len(saved_paths) == 1 else json.dumps(saved_paths)
+            log_cyan(f"✅ {len(saved_paths)}/{len(images)} image(s) enregistrée(s) avec métadonnées -> {dest_dir}")
             return {"ui": {"images": results}, "result": (out_str,)}
 
         # ----------------------------------------------------------------------
