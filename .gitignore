@@ -23,3 +23,6 @@ temp/
 # OS
 .DS_Store
 Thumbs.db
+
+node.zip
+*.zip
