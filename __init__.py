@@ -27,7 +27,7 @@ except ImportError:
 
 
 # ==============================================================================
-# LOGGER CENTRALISÉ (SORTIE TERMINAL BLEU CIEL)
+# LOGGER CENTRALISÉ & GESTION DES NOMS DE FICHIERS NUMÉROTÉS
 # ==============================================================================
 
 def log_cyan(msg: str, is_error: bool = False):
@@ -48,7 +48,6 @@ def get_ffmpeg_cmd():
         except Exception as e:
             log_cyan(f"Avertissement imageio-ffmpeg: {e}")
 
-    # Secours : vérification du PATH système
     if shutil.which("ffmpeg"):
         return "ffmpeg"
 
@@ -65,126 +64,89 @@ def get_default_downloads_dir():
     return folder_paths.get_output_directory()
 
 
-# ==============================================================================
-# ÉCRITURE DES MÉTADONNÉES PNG VIA LE COMPOSANT NATIF WINDOWS (WIC / .NET)
-# ==============================================================================
-# Pillow écrit des chunks PNG tEXt/iTXt et un chunk exif valides (confirmé par nos
-# tests), mais l'explorateur Windows ne les lit quasiment jamais pour un PNG - même
-# quand ils sont parfaitement conformes à la spec. La seule façon fiable de faire
-# apparaître les métadonnées dans l'onglet "Détails" de Windows pour un PNG est de
-# les écrire avec le même composant que Windows utilise pour les lire : WIC, via les
-# classes .NET System.Windows.Media.Imaging (BitmapMetadata / PngBitmapEncoder).
-# On appelle donc PowerShell en post-traitement, uniquement sous Windows.
-
-_PS_SCRIPT_TEMPLATE = r'''
-param(
-    [Parameter(Mandatory=$true)][string]$FilePath,
-    [Parameter(Mandatory=$true)][string]$Author,
-    [Parameter(Mandatory=$true)][string]$Title,
-    [Parameter(Mandatory=$true)][string]$CommentText
-)
-
-Add-Type -AssemblyName PresentationCore
-
-try {
-    $uri = New-Object System.Uri($FilePath)
-    $decoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
-        $uri,
-        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-    )
-    $frame = $decoder.Frames[0]
-
-    $metadata = New-Object System.Windows.Media.Imaging.BitmapMetadata("png")
-
-    # IMPORTANT : on utilise les propriétés typées de BitmapMetadata (Author/Title/
-    # Comment) plutôt que des chemins SetQuery bruts ("/tEXt/{str=Author}" etc.).
-    # Test empirique : les chemins bruts pour Author/Title ne persistaient PAS après
-    # l'encodage PNG (seul Comment survivait), alors que les propriétés typées sont
-    # l'API officiellement supportée par chaque codec pour un round-trip fiable.
-    $authorList = New-Object 'System.Collections.Generic.List[string]'
-    $authorList.Add($Author)
-    $metadata.Author = $authorList.AsReadOnly()
-    $metadata.Title = $Title
-    $metadata.Comment = $CommentText
-
-    $newFrame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
-        $frame, $frame.Thumbnail, $metadata, $frame.ColorContexts
-    )
-
-    $tempPath = "$FilePath.aiact_tmp.png"
-    $stream = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::Create)
-    $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
-    $encoder.Frames.Add($newFrame)
-    $encoder.Save($stream)
-    $stream.Close()
-
-    Move-Item -Force $tempPath $FilePath
-
-    # Vérification immédiate : on relit le fichier qu'on vient d'écrire et on
-    # renvoie ce que WIC lui-même retrouve, pour diagnostiquer sans ambiguïté.
-    $verifyDecoder = [System.Windows.Media.Imaging.BitmapDecoder]::Create(
-        (New-Object System.Uri($FilePath)),
-        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
-        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-    )
-    $verifyMeta = $verifyDecoder.Frames[0].Metadata
-    $verifiedAuthor = if ($verifyMeta.Author) { $verifyMeta.Author -join ";" } else { "(vide)" }
-    $verifiedTitle = if ($verifyMeta.Title) { $verifyMeta.Title } else { "(vide)" }
-    $verifiedComment = if ($verifyMeta.Comment) { $verifyMeta.Comment } else { "(vide)" }
-    Write-Output "OK author='$verifiedAuthor' title='$verifiedTitle' comment='$verifiedComment'"
-}
-catch {
-    Write-Output "ERROR: $($_.Exception.Message)"
-    exit 1
-}
-'''
-
-
-def write_windows_native_png_metadata(file_path, author, title, comment_text):
+def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
     """
-    Réécrit le PNG situé à file_path en y injectant les métadonnées via le
-    pipeline WIC natif de Windows (.NET/PowerShell), pour garantir la
-    compatibilité avec l'onglet Détails de l'explorateur Windows.
-    Retourne (succes: bool, message: str). No-op (True, "ignoré (non-Windows)")
-    sur les systèmes non-Windows.
+    Gère l'incrémentation automatique du nom de fichier dans dest_dir.
+    - Détecte les motifs type 'NNNN' (ex: AI_Act_OutputNNNN.mp4 -> AI_Act_Output0001.mp4)
+    - Si le fichier sans motif existe déjà, ajoute un suffixe '_0001', '_0002'...
     """
-    if os.name != "nt":
-        return True, "ignoré (système non-Windows)"
+    ext = ext.lstrip('.')
+    
+    # 1. Gestion du motif avec 'N' (ex: NNNN)
+    match_n = re.search(r'(N+)', filename)
+    if match_n:
+        n_group = match_n.group(1)
+        padding = len(n_group)
+        prefix = filename[:match_n.start()]
+        suffix = filename[match_n.end():]
+        
+        regex = re.compile(rf"^{re.escape(prefix)}(\d{{{padding}}}){re.escape(suffix)}\.{ext}$")
+        existing_counter = 0
+        if os.path.exists(dest_dir):
+            for f in os.listdir(dest_dir):
+                m = regex.match(f)
+                if m:
+                    existing_counter = max(existing_counter, int(m.group(1)))
+        
+        next_num = existing_counter + 1
+        num_str = f"{next_num:0{padding}d}"
+        final_name = f"{prefix}{num_str}{suffix}.{ext}"
+        log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{filename}.{ext}' = {num_str}")
+        return os.path.join(dest_dir, final_name)
 
-    try:
-        temp_dir = folder_paths.get_temp_directory()
-        ps_script_path = os.path.join(temp_dir, "ai_act_write_png_metadata.ps1")
-        with open(ps_script_path, "w", encoding="utf-8") as f:
-            f.write(_PS_SCRIPT_TEMPLATE)
+    # 2. Sécurité : si le fichier simple existe déjà, auto-incrément '_0001'
+    base_path = os.path.join(dest_dir, f"{filename}.{ext}")
+    if not os.path.exists(base_path):
+        return base_path
 
-        result = subprocess.run(
-            [
-                "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                "-File", ps_script_path,
-                "-FilePath", file_path,
-                "-Author", author,
-                "-Title", title,
-                "-CommentText", comment_text,
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-
-        if result.returncode != 0 or stdout.startswith("ERROR"):
-            return False, f"code={result.returncode} stdout='{stdout}' stderr='{stderr}'"
-        return True, stdout
-    except Exception as e:
-        return False, f"Exception Python: {e}"
+    regex = re.compile(rf"^{re.escape(filename)}_(\d{{4}})\.{ext}$")
+    existing_counter = 0
+    if os.path.exists(dest_dir):
+        for f in os.listdir(dest_dir):
+            m = regex.match(f)
+            if m:
+                existing_counter = max(existing_counter, int(m.group(1)))
+    
+    next_num = existing_counter + 1
+    num_str = f"{next_num:04d}"
+    final_name = f"{filename}_{num_str}.{ext}"
+    log_cyan(f"DEBUG: fichier existant -> incrémentation automatique '{final_name}'")
+    return os.path.join(dest_dir, final_name)
 
 
-# Gestion sécurisée de Mutagen & ID3 Lyrics
+def extract_audio_waveform_and_sr(audio):
+    """
+    Extrait la forme d'onde (Tensor) et le taux d'échantillonnage,
+    compatible dictionnaires standard et LazyAudioMap ComfyUI.
+    """
+    if audio is None:
+        return None, 44100
+    
+    waveform = None
+    sr = 44100
+
+    if hasattr(audio, "get"):
+        waveform = audio.get("waveform", audio)
+        sr = audio.get("sample_rate", 44100)
+    elif hasattr(audio, "__getitem__"):
+        try:
+            waveform = audio["waveform"]
+            sr = audio["sample_rate"]
+        except Exception:
+            waveform = audio
+            sr = 44100
+    else:
+        waveform = audio
+
+    return waveform, sr
+
+
+# Import Mutagen & ID3 Lyrics
 try:
     import mutagen
     from mutagen.easyid3 import EasyID3
     from mutagen.mp3 import MP3
-    from mutagen.id3 import ID3, USLT, COMM, ID3NoHeaderError
+    from mutagen.id3 import ID3, USLT, COMM
     MUTAGEN_LOADED = True
 except ImportError:
     mutagen = None
@@ -193,7 +155,6 @@ except ImportError:
     ID3 = None
     USLT = None
     COMM = None
-    ID3NoHeaderError = Exception
     MUTAGEN_LOADED = False
 
 
@@ -235,14 +196,14 @@ class MP3TagUploader_v5:
 
         full_path = None
 
-        # 1. Recherche via le dictionnaire AUDIO si un chemin y est attaché
-        if audio is not None and isinstance(audio, dict):
-            if "path" in audio and os.path.exists(audio["path"]):
-                full_path = audio["path"]
-            elif "filename" in audio:
-                audio_file_name = audio["filename"]
+        if audio is not None and hasattr(audio, "get"):
+            path_val = audio.get("path")
+            filename_val = audio.get("filename")
+            if path_val and os.path.exists(path_val):
+                full_path = path_val
+            elif filename_val:
+                audio_file_name = filename_val
 
-        # 2. Recherche du fichier sur le disque
         if not full_path and audio_file_name:
             cwd = os.getcwd()
             comfy_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -276,13 +237,11 @@ class MP3TagUploader_v5:
         lyrics_text = ""
 
         try:
-            # Extraction des métadonnées standards (Artist, Title)
             audio_obj = mutagen.File(full_path, easy=True)
             if audio_obj is not None:
                 author = audio_obj.get("artist", ["Inconnu"])[0]
                 title = audio_obj.get("title", ["Inconnu"])[0] 
 
-            # Extraction des paroles / texte TTS via ID3 USLT / COMM
             if ID3:
                 try:
                     id3_tags = ID3(full_path)
@@ -294,7 +253,7 @@ class MP3TagUploader_v5:
                         if comm_frames:
                             lyrics_text = str(comm_frames[0].text)
                 except Exception as e_id3:
-                    log_cyan(f"Information : Pas de tag ID3 USLT/COMM lisible dans '{audio_file_name}': {e_id3}")
+                    log_cyan(f"Information : Pas de tag ID3 USLT/COMM dans '{audio_file_name}': {e_id3}")
 
             filename_safe_title = self.format_title_for_filename(title)
             log_cyan(f"✅ Tags lus ('{os.path.basename(full_path)}') -> Auteur: '{author}' | Paroles: {len(lyrics_text)} car. | Titre: '{title}'")
@@ -322,25 +281,23 @@ class UniversalAIActSaver:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "filename": ("STRING", {"default": "AI_Act_Output"}),
+                "filename": ("STRING", {"default": "AI_Act_OutputNNNN"}),
                 "author": ("STRING", {"default": "AI Generator"}),
                 "title": ("STRING", {"default": "AI Generated Media"}),
                 "ai_label": ("STRING", {"default": "Généré par IA"}),
                 "save_path": ("STRING", {"default": get_default_downloads_dir()}),
                 "export_mode": ([
                     "Auto-détection",
-                    "Image JPG (Visible dans Windows)",
                     "Image PNG",
                     "Vidéo MP4",
                     "Audio MP3"
                 ], {"default": "Auto-détection"}),
-                "auto_increment": ("BOOLEAN", {"default": True, "label_on": "Numérotation auto (0001, 0002...)", "label_off": "Nom fixe (écrase le précédent)"}),
             },
             "optional": {
                 "images": ("IMAGE",),
                 "audio": ("AUDIO",),
-                "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0, "step": 1.0}),
-                "lyrics": ("STRING", {"default": "", "multiline": True, "placeholder": "Collez ou connectez ici le texte/script TTS utilisé..."}),
+                "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 1.0}),
+                "lyrics": ("STRING", {"default": "", "multiline": True, "placeholder": "Texte ou paroles TTS..."}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -354,32 +311,8 @@ class UniversalAIActSaver:
     def sanitize_filename(self, filename):
         return re.sub(r'[\\/:*?"<>|]', '_', filename).strip()
 
-    def get_next_available_number(self, dest_dir, clean_name, ext):
-        """
-        Scanne dest_dir à la recherche de fichiers 'clean_nameNNNN.ext' et retourne
-        le prochain numéro libre (max trouvé + 1, ou 1 si aucun fichier existant).
-        Chaque extension (png, mp4, mp3...) a son propre compteur indépendant.
-        """
-        pattern = re.compile(rf'^{re.escape(clean_name)}(\d+)\.{re.escape(ext)}$', re.IGNORECASE)
-        max_num = 0
-        try:
-            for fname in os.listdir(dest_dir):
-                m = pattern.match(fname)
-                if m:
-                    max_num = max(max_num, int(m.group(1)))
-        except Exception as e:
-            log_cyan(f"Avertissement lors du scan de numérotation dans '{dest_dir}': {e}")
-        return max_num + 1
-
-    def process(self, filename="AI_Act_Output", author="AI Generator", title="AI Generated Media", ai_label="Généré par IA", save_path="", export_mode="Auto-détection", auto_increment=True, images=None, audio=None, fps=25.0, lyrics="", prompt=None, extra_pnginfo=None):
-
-        # Garde de sécurité : un fps à 0 (ou négatif) fait planter l'écriture vidéo
-        # (imageio/ffmpeg divisent par fps). On retombe sur 25 si jamais une valeur
-        # invalide arrive malgré le "min" défini dans INPUT_TYPES.
-        if not fps or fps <= 0:
-            log_cyan(f"⚠️  fps invalide reçu ({fps}), utilisation de 25.0 par défaut", is_error=True)
-            fps = 25.0
-
+    def process(self, filename="AI_Act_OutputNNNN", author="AI Generator", title="AI Generated Media", ai_label="Généré par IA", save_path="", export_mode="Auto-détection", images=None, audio=None, fps=24.0, lyrics="", prompt=None, extra_pnginfo=None):
+        
         clean_name = self.sanitize_filename(filename)
         dest_dir = save_path.strip() if save_path else get_default_downloads_dir()
         
@@ -393,42 +326,30 @@ class UniversalAIActSaver:
         target_type = export_mode
         if target_type == "Auto-détection":
             if audio is not None and images is None:
-                # Audio seul -> MP3
                 target_type = "Audio MP3"
             elif images is not None and audio is not None:
-                # Images + Audio -> on suppose une séquence animée avec son -> Vidéo
                 target_type = "Vidéo MP4"
             elif images is not None:
-                # Images seules (une ou plusieurs) SANS audio -> toujours PNG, y compris
-                # pour une seule image : le JPG ne supporte pas le canal alpha, qui est
-                # requis ici. La compatibilité avec l'explorateur Windows est assurée par
-                # write_windows_native_png_metadata() (réécriture WIC), pas par le choix
-                # du format JPG.
                 target_type = "Image PNG"
             else:
                 log_cyan("Aucun flux d'entrée connecté.", is_error=True)
                 return {"ui": {}, "result": ("Aucune entrée connectée",)}
 
         # ----------------------------------------------------------------------
-        # CAS 1 : IMAGE (JPG / PNG)
+        # CAS 1 : IMAGE PNG
         # ----------------------------------------------------------------------
         if "Image" in target_type:
             if images is None:
                 log_cyan("Erreur : l'entrée 'images' est vide.", is_error=True)
                 return {"ui": {}, "result": ("Erreur: Image manquante",)}
 
-            is_jpg = "JPG" in target_type
-            ext = "jpg" if is_jpg else "png"
             results = []
             saved_paths = []
-
-            start_num = self.get_next_available_number(dest_dir, clean_name, ext) if auto_increment else None
+            timestamp_id = int(time.time())
 
             for idx, img_tensor in enumerate(images):
                 img_np = (255. * img_tensor.cpu().numpy()).clip(0, 255).astype(np.uint8)
                 pil_img = Image.fromarray(img_np)
-                if is_jpg and pil_img.mode == "RGBA":
-                    pil_img = pil_img.convert("RGB")
 
                 exif = pil_img.getexif()
                 exif[0x013B] = author
@@ -439,84 +360,34 @@ class UniversalAIActSaver:
                     exif[0x9C9D] = author.encode('utf-16-le')
                     exif[0x9C9B] = title.encode('utf-16-le')
                     exif[0x9C9C] = f"{ai_label} - EU AI Act Art. 50".encode('utf-16-le')
-                except Exception:
-                    pass
+                except Exception as e_xp:
+                    log_cyan(f"Erreur encodage XPAuthor: {e_xp}", is_error=True)
 
                 exif_bytes = exif.tobytes()
-                if auto_increment:
-                    final_file_path = os.path.join(dest_dir, f"{clean_name}{start_num + idx:04d}.{ext}")
+
+                metadata = PngImagePlugin.PngInfo()
+                metadata.add_text("Author", author)
+                metadata.add_text("Artist", author)
+                metadata.add_text("Title", title)
+                metadata.add_text("Comment", f"{ai_label} - EU AI Act Art. 50")
+                if lyrics:
+                    metadata.add_text("Description", lyrics)
+
+                if "N" in clean_name:
+                    final_file_path = generate_numbered_filepath(dest_dir, clean_name, "png")
                 else:
                     suffix = f"_{idx:04d}" if len(images) > 1 else ""
-                    final_file_path = os.path.join(dest_dir, f"{clean_name}{suffix}.{ext}")
+                    final_file_path = os.path.join(dest_dir, f"{clean_name}{suffix}.png")
 
-                metadata = None
-                if not is_jpg:
-                    # IMPORTANT: on utilise add_itxt (chunk iTXt, UTF-8) et non add_text
-                    # (chunk tEXt, Latin-1 strict). Nos textes contiennent des accents
-                    # français (ex: "Généré par IA"), qui produisent des octets Latin-1
-                    # invalides en UTF-8. Certains lecteurs de métadonnées (dont
-                    # l'explorateur Windows) décodent en UTF-8 strict et abandonnent
-                    # silencieusement la lecture de TOUTES les métadonnées du fichier
-                    # dès qu'un seul chunk est mal formé. iTXt règle ce problème à la
-                    # racine en étant explicitement encodé en UTF-8.
-                    comment_text = f"{ai_label} - EU AI Act Art. 50"
-                    metadata = PngImagePlugin.PngInfo()
-                    metadata.add_itxt("Author", author)
-                    metadata.add_itxt("Artist", author)
-                    metadata.add_itxt("Title", title)
-                    metadata.add_itxt("Comment", comment_text)
-                    # Un seul chunk "Description" (certains lecteurs ne gardent que le
-                    # premier/dernier en cas de doublon) : priorité aux paroles/texte TTS
-                    # si présent, sinon le texte de transparence IA.
-                    metadata.add_itxt("Description", lyrics if lyrics else comment_text)
-
-                file_label = os.path.basename(final_file_path)
-
-                try:
-                    if is_jpg:
-                        pil_img.save(final_file_path, format="JPEG", quality=95, exif=exif_bytes)
-                    else:
-                        pil_img.save(final_file_path, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
-                except Exception as e_save:
-                    log_cyan(f"❌ Métadonnées NON appliquées ({file_label}) : échec d'écriture -> {e_save}", is_error=True)
-                    continue
-
-                # Sur PNG, on repasse par le pipeline natif Windows (WIC/.NET) pour que
-                # les métadonnées soient visibles dans l'onglet Détails de l'explorateur.
-                win_ok, win_msg = (True, "") if is_jpg else write_windows_native_png_metadata(
-                    final_file_path, author, title, f"{ai_label} - EU AI Act Art. 50"
-                )
-
+                pil_img.save(final_file_path, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
                 saved_paths.append(final_file_path)
 
-                temp_preview = os.path.join(folder_paths.get_temp_directory(), f"prev_{int(time.time())}_{idx}.{ext}")
-                try:
-                    if is_jpg:
-                        pil_img.save(temp_preview, format="JPEG", quality=95, exif=exif_bytes)
-                    else:
-                        pil_img.save(temp_preview, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
-                except Exception as e_prev:
-                    log_cyan(f"⚠️  Preview non générée ({file_label}) : {e_prev}", is_error=True)
-                    if win_ok:
-                        log_cyan(f"✅ Métadonnées appliquées : {file_label}")
-                    else:
-                        log_cyan(f"❌ Métadonnées NON appliquées ({file_label}) : échec réécriture WIC/Windows -> {win_msg}", is_error=True)
-                    continue
-
-                # Le clic droit -> "Save Image" dans l'UI ComfyUI sauvegarde CE fichier
-                # de preview, pas le fichier final écrit plus haut. Il doit donc lui aussi
-                # passer par la réécriture WIC/Windows pour avoir des métadonnées visibles.
-                win_ok_prev, win_msg_prev = (True, "") if is_jpg else write_windows_native_png_metadata(
-                    temp_preview, author, title, f"{ai_label} - EU AI Act Art. 50"
-                )
-
-                if win_ok and win_ok_prev:
-                    log_cyan(f"✅ Métadonnées appliquées : {file_label}")
-                else:
-                    err = win_msg if not win_ok else win_msg_prev
-                    log_cyan(f"❌ Métadonnées NON appliquées ({file_label}) : échec réécriture WIC/Windows -> {err}", is_error=True)
+                temp_preview = os.path.join(folder_paths.get_temp_directory(), f"prev_{timestamp_id}_{idx:04d}.png")
+                pil_img.save(temp_preview, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
 
                 results.append({"filename": os.path.basename(temp_preview), "subfolder": "", "type": "temp"})
+
+            log_cyan(f"✅ {len(saved_paths)} image(s) PNG enregistrée(s) avec succès dans '{dest_dir}'.")
 
             out_str = saved_paths[0] if len(saved_paths) == 1 else json.dumps(saved_paths)
             return {"ui": {"images": results}, "result": (out_str,)}
@@ -533,8 +404,7 @@ class UniversalAIActSaver:
                 log_cyan("Erreur : torchaudio n'est pas disponible.", is_error=True)
                 return {"ui": {}, "result": ("Erreur: torchaudio manquant",)}
 
-            waveform = audio.get("waveform") if isinstance(audio, dict) else audio
-            sr = audio.get("sample_rate", 44100) if isinstance(audio, dict) else 44100
+            waveform, sr = extract_audio_waveform_and_sr(audio)
 
             waveform_save = waveform.clone().cpu()
             if waveform_save.dim() == 3:
@@ -547,12 +417,7 @@ class UniversalAIActSaver:
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
             temp_wav = os.path.join(temp_dir, f"temp_{timestamp_id}.wav")
-            if auto_increment:
-                mp3_num = self.get_next_available_number(dest_dir, clean_name, "mp3")
-                log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{clean_name}NNNN.mp3' = {mp3_num:04d}")
-                final_mp3 = os.path.join(dest_dir, f"{clean_name}{mp3_num:04d}.mp3")
-            else:
-                final_mp3 = os.path.join(dest_dir, f"{clean_name}.mp3")
+            final_mp3 = generate_numbered_filepath(dest_dir, clean_name, "mp3")
             temp_mp3_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp3")
 
             torchaudio.save(temp_wav, waveform_save, sr, format="wav")
@@ -609,13 +474,13 @@ class UniversalAIActSaver:
                         except Exception as e_id3:
                             log_cyan(f"Erreur écriture ID3 USLT: {e_id3}", is_error=True)
 
-            log_cyan(f"✅ Fichier Audio MP3 enregistré avec paroles/TTS ({len(lyrics)} car.) -> {final_mp3}")
+            log_cyan(f"✅ Fichier Audio MP3 enregistré avec paroles/TTS -> {final_mp3}")
             
             preview_res = {"filename": os.path.basename(temp_mp3_preview), "subfolder": "", "type": "temp", "format": "audio/mp3"}
             return {"ui": {"audio": [preview_res]}, "result": (final_mp3,)}
 
         # ----------------------------------------------------------------------
-        # CAS 3 : VIDÉO MP4
+        # CAS 3 : VIDÉO MP4 (AVEC NUMÉROTATION AUTO FIXÉE)
         # ----------------------------------------------------------------------
         elif "Vidéo" in target_type:
             if images is None:
@@ -628,12 +493,9 @@ class UniversalAIActSaver:
             
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
-            if auto_increment:
-                mp4_num = self.get_next_available_number(dest_dir, clean_name, "mp4")
-                log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{clean_name}NNNN.mp4' = {mp4_num:04d}")
-                final_mp4 = os.path.join(dest_dir, f"{clean_name}{mp4_num:04d}.mp4")
-            else:
-                final_mp4 = os.path.join(dest_dir, f"{clean_name}.mp4")
+            
+            # Détermination du nom avec incrémentation automatique
+            final_mp4 = generate_numbered_filepath(dest_dir, clean_name, "mp4")
             temp_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp4")
 
             ffmpeg_metadata = [
@@ -651,8 +513,7 @@ class UniversalAIActSaver:
                     writer.append_data(frame)
                 writer.close()
 
-                waveform = audio.get("waveform") if isinstance(audio, dict) else audio
-                sr = audio.get("sample_rate", 44100) if isinstance(audio, dict) else 44100
+                waveform, sr = extract_audio_waveform_and_sr(audio)
 
                 waveform_save = waveform.clone().cpu()
                 if waveform_save.dim() == 3:
@@ -718,7 +579,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MP3TagUploader_v5": "MP3 Tag Uploader / Loader (v5)",
-    "UniversalAIActSaver": "Universal AI Act Saver (Image / Audio / Vidéo)",
+    "UniversalAIActSaver": "Universal AI Act Saver (Image PNG / Audio MP3 / Vidéo MP4)",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
