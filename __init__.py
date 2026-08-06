@@ -36,10 +36,6 @@ def log_cyan(msg: str, is_error: bool = False):
 
 
 def get_ffmpeg_cmd():
-    """
-    Récupère le chemin du binaire FFmpeg embarqué dans imageio-ffmpeg.
-    Fallback sur le FFmpeg du système si besoin.
-    """
     if imageio_ffmpeg is not None:
         try:
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -67,12 +63,30 @@ def get_default_downloads_dir():
 def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
     """
     Gère l'incrémentation automatique du nom de fichier dans dest_dir.
-    - Détecte les motifs type 'NNNN' (ex: AI_Act_OutputNNNN.mp4 -> AI_Act_Output0001.mp4)
-    - Si le fichier sans motif existe déjà, ajoute un suffixe '_0001', '_0002'...
+    - Supporte %date%, NNNN, %NNNN%, %counter%
+    - Garantit la création d'un numéro (_0001) dès la première exécution.
     """
     ext = ext.lstrip('.')
     
-    # 1. Gestion du motif avec 'N' (ex: NNNN)
+    # 1. Remplacement des tags de date (%date% ou %date:yyyy-MM-dd%)
+    now = time.localtime()
+    filename = filename.replace("%date%", time.strftime("%Y-%m-%d", now))
+    filename = re.sub(
+        r'%date:([^%]+)%',
+        lambda m: time.strftime(
+            m.group(1).replace("yyyy", "%Y").replace("MM", "%m").replace("dd", "%d")
+                     .replace("HH", "%H").replace("mm", "%M").replace("ss", "%S"),
+            now
+        ),
+        filename
+    )
+
+    # 2. Normalisation des tokens de comptage
+    filename = re.sub(r'%NNNN%', 'NNNN', filename)
+    filename = re.sub(r'%NN%', 'NN', filename)
+    filename = re.sub(r'%counter%', 'NNNN', filename)
+
+    # 3. Motif 'N' explicite présent dans le nom (ex: AI_Act_OutputNNNN)
     match_n = re.search(r'(N+)', filename)
     if match_n:
         n_group = match_n.group(1)
@@ -80,43 +94,45 @@ def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
         prefix = filename[:match_n.start()]
         suffix = filename[match_n.end():]
         
-        regex = re.compile(rf"^{re.escape(prefix)}(\d{{{padding}}}){re.escape(suffix)}\.{ext}$")
+        regex = re.compile(rf"^{re.escape(prefix)}(\d{{{padding}}}){re.escape(suffix)}\.{ext}$", re.IGNORECASE)
         existing_counter = 0
         if os.path.exists(dest_dir):
             for f in os.listdir(dest_dir):
                 m = regex.match(f)
                 if m:
-                    existing_counter = max(existing_counter, int(m.group(1)))
+                    try:
+                        existing_counter = max(existing_counter, int(m.group(1)))
+                    except ValueError:
+                        pass
         
         next_num = existing_counter + 1
         num_str = f"{next_num:0{padding}d}"
         final_name = f"{prefix}{num_str}{suffix}.{ext}"
-        log_cyan(f"DEBUG: numérotation auto activée -> prochain numéro libre pour '{filename}.{ext}' = {num_str}")
+        log_cyan(f"DEBUG: Motif NNNN détecté -> '{final_name}'")
         return os.path.join(dest_dir, final_name)
 
-    # 2. Sécurité : si le fichier simple existe déjà, auto-incrément '_0001'
-    base_path = os.path.join(dest_dir, f"{filename}.{ext}")
-    if not os.path.exists(base_path):
-        return base_path
-
-    regex = re.compile(rf"^{re.escape(filename)}_(\d{{4}})\.{ext}$")
+    # 4. Si AUCUN motif 'N' n'est fourni, ajout d'un suffixe numéroté dès la 1ère fois (_0001, _0002, etc.)
+    regex = re.compile(rf"^{re.escape(filename)}_(\d{{4}})\.{ext}$", re.IGNORECASE)
     existing_counter = 0
     if os.path.exists(dest_dir):
         for f in os.listdir(dest_dir):
             m = regex.match(f)
             if m:
-                existing_counter = max(existing_counter, int(m.group(1)))
+                try:
+                    existing_counter = max(existing_counter, int(m.group(1)))
+                except ValueError:
+                    pass
     
     next_num = existing_counter + 1
     num_str = f"{next_num:04d}"
     final_name = f"{filename}_{num_str}.{ext}"
-    log_cyan(f"DEBUG: fichier existant -> incrémentation automatique '{final_name}'")
+    log_cyan(f"DEBUG: Incrémentation auto (suffixe) -> '{final_name}'")
     return os.path.join(dest_dir, final_name)
 
 
 def extract_audio_waveform_and_sr(audio):
     """
-    Extrait la forme d'onde (Tensor) et le taux d'échantillonnage,
+    Extrait de façon sécurisée la forme d'onde (Tensor) et le taux d'échantillonnage,
     compatible dictionnaires standard et LazyAudioMap ComfyUI.
     """
     if audio is None:
@@ -373,11 +389,7 @@ class UniversalAIActSaver:
                 if lyrics:
                     metadata.add_text("Description", lyrics)
 
-                if "N" in clean_name:
-                    final_file_path = generate_numbered_filepath(dest_dir, clean_name, "png")
-                else:
-                    suffix = f"_{idx:04d}" if len(images) > 1 else ""
-                    final_file_path = os.path.join(dest_dir, f"{clean_name}{suffix}.png")
+                final_file_path = generate_numbered_filepath(dest_dir, clean_name, "png")
 
                 pil_img.save(final_file_path, format="PNG", pnginfo=metadata, exif=exif_bytes, compress_level=4)
                 saved_paths.append(final_file_path)
@@ -480,7 +492,7 @@ class UniversalAIActSaver:
             return {"ui": {"audio": [preview_res]}, "result": (final_mp3,)}
 
         # ----------------------------------------------------------------------
-        # CAS 3 : VIDÉO MP4 (AVEC NUMÉROTATION AUTO FIXÉE)
+        # CAS 3 : VIDÉO MP4
         # ----------------------------------------------------------------------
         elif "Vidéo" in target_type:
             if images is None:
@@ -494,7 +506,7 @@ class UniversalAIActSaver:
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
             
-            # Détermination du nom avec incrémentation automatique
+            # Génération dynamique du chemin MP4 numéroté
             final_mp4 = generate_numbered_filepath(dest_dir, clean_name, "mp4")
             temp_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp4")
 
