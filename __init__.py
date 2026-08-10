@@ -62,9 +62,7 @@ def get_default_downloads_dir():
 
 def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
     """
-    Gère l'incrémentation automatique du nom de fichier dans dest_dir.
-    - Supporte %date%, NNNN, %NNNN%, %counter%
-    - Garantit la création d'un numéro (_0001) dès la première exécution.
+    Gère l'incrémentation automatique du nom de fichier dans dest_dir pour PNG et MP4.
     """
     ext = ext.lstrip('.')
     
@@ -86,7 +84,7 @@ def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
     filename = re.sub(r'%NN%', 'NN', filename)
     filename = re.sub(r'%counter%', 'NNNN', filename)
 
-    # 3. Motif 'N' explicite présent dans le nom (ex: AI_Act_OutputNNNN)
+    # 3. Motif 'N' explicite présent dans le nom
     match_n = re.search(r'(N+)', filename)
     if match_n:
         n_group = match_n.group(1)
@@ -108,10 +106,9 @@ def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
         next_num = existing_counter + 1
         num_str = f"{next_num:0{padding}d}"
         final_name = f"{prefix}{num_str}{suffix}.{ext}"
-        log_cyan(f"DEBUG: Motif NNNN détecté -> '{final_name}'")
         return os.path.join(dest_dir, final_name)
 
-    # 4. Si AUCUN motif 'N' n'est fourni, ajout d'un suffixe numéroté dès la 1ère fois (_0001, _0002, etc.)
+    # 4. Suffixe numéroté par défaut
     regex = re.compile(rf"^{re.escape(filename)}_(\d{{4}})\.{ext}$", re.IGNORECASE)
     existing_counter = 0
     if os.path.exists(dest_dir):
@@ -126,15 +123,10 @@ def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
     next_num = existing_counter + 1
     num_str = f"{next_num:04d}"
     final_name = f"{filename}_{num_str}.{ext}"
-    log_cyan(f"DEBUG: Incrémentation auto (suffixe) -> '{final_name}'")
     return os.path.join(dest_dir, final_name)
 
 
 def extract_audio_waveform_and_sr(audio):
-    """
-    Extrait de façon sécurisée la forme d'onde (Tensor) et le taux d'échantillonnage,
-    compatible dictionnaires standard et LazyAudioMap ComfyUI.
-    """
     if audio is None:
         return None, 44100
     
@@ -198,7 +190,6 @@ class MP3TagUploader_v5:
         if not title or title in ["Inconnu", "title", "Erreur lecture"]:
             return "audio_file_output"
         
-        # Extraction stricte des 4 premiers mots
         words = title.strip().split()[:4]
         short_title = " ".join(words)
         
@@ -332,7 +323,6 @@ class UniversalAIActSaver:
 
     def process(self, filename="AI_Act_OutputNNNN", author="AI Generator", title="AI Generated Media", ai_label="Généré par IA", save_path="", export_mode="Auto-détection", images=None, audio=None, fps=24.0, lyrics="", prompt=None, extra_pnginfo=None):
         
-        clean_name = self.sanitize_filename(filename)
         dest_dir = save_path.strip() if save_path else get_default_downloads_dir()
         
         if not os.path.exists(dest_dir):
@@ -362,6 +352,7 @@ class UniversalAIActSaver:
                 log_cyan("Erreur : l'entrée 'images' est vide.", is_error=True)
                 return {"ui": {}, "result": ("Erreur: Image manquante",)}
 
+            clean_name = self.sanitize_filename(filename)
             results = []
             saved_paths = []
             timestamp_id = int(time.time())
@@ -408,7 +399,7 @@ class UniversalAIActSaver:
             return {"ui": {"images": results}, "result": (out_str,)}
 
         # ----------------------------------------------------------------------
-        # CAS 2 : AUDIO MP3
+        # CAS 2 : AUDIO MP3 (Conservation des 4 premiers mots, SANS incrémentation)
         # ----------------------------------------------------------------------
         elif "Audio" in target_type:
             if audio is None:
@@ -419,10 +410,10 @@ class UniversalAIActSaver:
                 log_cyan("Erreur : torchaudio n'est pas disponible.", is_error=True)
                 return {"ui": {}, "result": ("Erreur: torchaudio manquant",)}
 
-            # Extraction stricte des 4 premiers mots pour le nom du fichier MP3
-            raw_words = re.split(r'[\s_]+', clean_name.strip())
+            # Extraction des 4 premiers mots du nom fourni sans ajout de suffixe incrémenté
+            raw_words = re.split(r'[\s_]+', filename.strip())
             words = [w for w in raw_words if w][:4]
-            clean_name = "_".join(words) if words else "audio_output"
+            clean_audio_name = self.sanitize_filename("_".join(words)) if words else "audio_output"
 
             waveform, sr = extract_audio_waveform_and_sr(audio)
 
@@ -437,7 +428,9 @@ class UniversalAIActSaver:
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
             temp_wav = os.path.join(temp_dir, f"temp_{timestamp_id}.wav")
-            final_mp3 = generate_numbered_filepath(dest_dir, clean_name, "mp3")
+            
+            # Sauvegarde directe basée uniquement sur le nom sanitisé des 4 mots
+            final_mp3 = os.path.join(dest_dir, f"{clean_audio_name}.mp3")
             temp_mp3_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp3")
 
             torchaudio.save(temp_wav, waveform_save, sr, format="wav")
@@ -494,7 +487,7 @@ class UniversalAIActSaver:
                         except Exception as e_id3:
                             log_cyan(f"Erreur écriture ID3 USLT: {e_id3}", is_error=True)
 
-            log_cyan(f"✅ Fichier Audio MP3 enregistré avec paroles/TTS -> {final_mp3}")
+            log_cyan(f"✅ Fichier Audio MP3 enregistré sans numérotation -> {final_mp3}")
             
             preview_res = {"filename": os.path.basename(temp_mp3_preview), "subfolder": "", "type": "temp", "format": "audio/mp3"}
             return {"ui": {"audio": [preview_res]}, "result": (final_mp3,)}
@@ -507,6 +500,7 @@ class UniversalAIActSaver:
                 log_cyan("Erreur : l'entrée 'images' est vide pour la vidéo.", is_error=True)
                 return {"ui": {}, "result": ("Erreur: Images manquantes pour vidéo",)}
 
+            clean_name = self.sanitize_filename(filename)
             ffmpeg_bin = get_ffmpeg_cmd()
 
             frames = [(255. * img.cpu().numpy()).clip(0, 255).astype(np.uint8) for img in images]
@@ -586,7 +580,7 @@ class UniversalAIActSaver:
 
 
 # ==============================================================================
-# 3. MAPPINGS ET EXPORT
+# 3. MAPPINGS ET EXPORT COMFYUI
 # ==============================================================================
 
 WEB_DIRECTORY = "./web"
