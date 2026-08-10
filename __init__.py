@@ -75,7 +75,7 @@ def generate_numbered_filepath(dest_dir: str, filename: str, ext: str) -> str:
         r'%date:([^%]+)%',
         lambda m: time.strftime(
             m.group(1).replace("yyyy", "%Y").replace("MM", "%m").replace("dd", "%d")
-                     .replace("HH", "%H").replace("mm", "%M").replace("ss", "%S"),
+                      .replace("HH", "%H").replace("mm", "%M").replace("ss", "%S"),
             now
         ),
         filename
@@ -198,12 +198,15 @@ class MP3TagUploader_v5:
         if not title or title in ["Inconnu", "title", "Erreur lecture"]:
             return "audio_file_output"
         
-        safe_title = title[:30]
-        safe_title = safe_title.replace(" ", "_")
+        # Extraction stricte des 4 premiers mots
+        words = title.strip().split()[:4]
+        short_title = " ".join(words)
+        
+        safe_title = short_title.replace(" ", "_")
         safe_title = re.sub(r'[\\/:*?"<>|]', '', safe_title)
         safe_title = re.sub(r'__+', '_', safe_title)
         safe_title = safe_title.strip('_')
-        return safe_title
+        return safe_title if safe_title else "audio_file_output"
 
     def extract(self, audio_file_name="", audio=None):
         if not MUTAGEN_LOADED:
@@ -416,6 +419,11 @@ class UniversalAIActSaver:
                 log_cyan("Erreur : torchaudio n'est pas disponible.", is_error=True)
                 return {"ui": {}, "result": ("Erreur: torchaudio manquant",)}
 
+            # Extraction stricte des 4 premiers mots pour le nom du fichier MP3
+            raw_words = re.split(r'[\s_]+', clean_name.strip())
+            words = [w for w in raw_words if w][:4]
+            clean_name = "_".join(words) if words else "audio_output"
+
             waveform, sr = extract_audio_waveform_and_sr(audio)
 
             waveform_save = waveform.clone().cpu()
@@ -506,7 +514,6 @@ class UniversalAIActSaver:
             temp_dir = folder_paths.get_temp_directory()
             timestamp_id = int(time.time())
             
-            # Génération dynamique du chemin MP4 numéroté
             final_mp4 = generate_numbered_filepath(dest_dir, clean_name, "mp4")
             temp_preview = os.path.join(temp_dir, f"prev_{timestamp_id}.mp4")
 
